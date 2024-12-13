@@ -1,0 +1,141 @@
+<#
+# Check for Windows 11 compatibility using PowerShell
+# Written by Jared Tillford 12/10/2024
+# For use in Datto RMM Automation
+# 
+# Success is defined as a computer that passes all checks, or is already Windows 11 or Windows Server
+#>
+
+# Define minimum requirements
+$minOSDiskSize = 64 # GB
+$minMemory = 4 # GB
+$minClockSpeed = 1000 # MHz
+$minLogicalCores = 2
+$minAddressWidth = 64 # bits
+
+# Set some other variables
+$exitVar = 0
+$exitSerial = 0
+
+# Get system information
+$osDisk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+$memory = Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum
+$processor = Get-CimInstance Win32_Processor
+$os = Get-CimInstance Win32_OperatingSystem
+$tpm = Get-Tpm
+$winSerial = (Get-WmiObject -query 'select * from SoftwareLicensingService').OA3xOriginalProductKey
+
+# Check Windows environment
+$isServer = (Get-CimInstance Win32_OperatingSystem).ProductType -ne 1
+$version = [System.Environment]::OSVersion.Version
+
+# Check if host is running Windows Server
+if($isServer) {
+    Write-Output "Detected server environment, no need to upgrade to Windows 11"
+    exit 0
+}
+# Check if host is running Windows 11
+if($version.Major -eq 10 -and $version.Build -ge 22000) {
+    Write-Output "Detected Windows 11, no need for upgrade"
+    exit 0
+}
+
+if(!$winSerial) {
+    function Get-WindowsKey {
+        $key = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform' -Name BackupProductKeyDefault
+        $global:WindowsProductKey = $key.BackupProductKeyDefault
+    }
+    Get-WindowsKey
+    if($WindowsProductKey) {
+        write-output "WARNING - This computer does not have a serial number burned in, this will need to be entered manually after upgrading to Windows 11: $WindowsProductKey"
+        $exitSerial = 1
+    }
+    if(!$WindowsProductKey) {
+        Write-Output "WARNING - This computer does not have a serial number burned in.  If client does not have a key, attempt to tie the digital serial number to our Microsoft account, otherwise, client will need to purchase a key."
+        $exitSerial = 1
+    }
+    
+}
+
+# Check OS disk size
+if ($osDisk.Size / 1GB -lt $minOSDiskSize) {
+    Write-Output "OS disk size does not meet requirements ($($osDisk.Size / 1GB) GB < $minOSDiskSize GB)"
+    $exitvar = 1
+}
+
+# Check memory
+if ($memory.Sum / 1GB -lt $minMemory) {
+    Write-Output "Memory does not meet requirements ($($memory.Sum / 1GB) GB < $minMemory GB)"
+    $exitvar = 1
+}
+
+# Check clock speed
+if ($processor.MaxClockSpeed -lt $minClockSpeed) {
+    Write-Output "Processor clock speed does not meet requirements ($($processor.MaxClockSpeed) MHz < $minClockSpeed MHz)"
+    $exitvar = 1
+}
+
+# Check logical cores
+if ($processor.NumberOfLogicalProcessors -lt $minLogicalCores) {
+    Write-Output "Number of logical cores does not meet requirements ($($processor.NumberOfLogicalProcessors) < $minLogicalCores)"
+    $exitvar = 1
+}
+
+# Check address width
+if ($os.OSArchitecture -ne "64-bit") {
+    Write-Output "OS architecture does not meet requirements ($($os.OSArchitecture) < $minAddressWidth-bit)"
+    $exitvar = 1
+}
+
+#Check TPM version
+if($null -eq $tpm) {
+    Write-Output "TPM value is Null"
+    $exitvar = 1
+}
+if (!$tpm.TpmPresent) {
+    Write-Output "TPM is not present"
+    $exitvar = 1
+}
+if ($tpm.TpmPresent) {
+    $tpmVersion = Get-WmiObject -Class Win32_Tpm -Namespace root\CIMV2\Security\MicrosoftTpm | Select-Object -Property SpecVersion
+    if ($null -eq $tpmVersion.SpecVersion) {
+        Write-Output "TPM Version value is Null"
+        $exitvar = 1
+    }
+    $majorVersion = $tpmVersion.SpecVersion.Split(",")[0] -as [int]
+    if ($majorVersion -lt 2) {
+        Write-Output "Current TPM version $majorVersion.  Check to see if upgrade is possible to 2.0"
+        $exitvar = 1
+    }
+}
+if ($tpm.GetType().Name -eq "String") { #This shouldn't happen, but in case it does...
+    Write-Output "Unexpected error, review line 347 of code from Microsoft"
+    $exitvar = 1
+}
+
+#Check for SecureBoot
+try {
+    $isSecureBootEnabled = Confirm-SecureBootUEFI
+}
+catch [System.PlatformNotSupportedException] {
+    Write-Output "Platform Not Supported for SecureBoot"
+    $exitvar = 1
+}
+catch [System.UnauthorizedAccessException] {
+    Write-Output "Unauthorized Access exception for SecureBoot"
+    $exitvar = 1
+}
+catch { #This shouldn't happen, but in case it does...
+    Write-Output "Unexpected error, review line 450 of code from Microsoft"
+    $exitvar = 1
+}
+
+# If all checks pass
+if($exitSerial -eq 1){
+    $exitVar = $null
+    exit $exitVar
+}
+else {
+    Write-Output "System meets Windows 11 requirements"
+    exit $exitVar
+}
